@@ -161,6 +161,58 @@
        (message 'assistant
                 (list (repeated repeated-items "<a><b>"))))))
 
+   (test-case "at-least-once handles ambiguous gen boundaries"
+     (define repeated-items
+       (at-least-once (list (gen 2))))
+     (define (model _transcript prefix)
+       (list
+        (token-candidate
+         (cond
+           [(string=? prefix "") "a"]
+           [(string=? prefix "a") "b"]
+           [(string=? prefix "ab") "c"]
+           [(string=? prefix "abc") "!"]
+           [else "x"])
+         0.0)))
+
+     (define result
+       (stream-first
+        (eval model
+              (list (assistant repeated-items (lit "!"))))))
+
+     (check-equal?
+      result
+      (list
+       (message 'assistant
+                (list (repeated repeated-items "abc")
+                      (lit "!"))))))
+
+   (test-case "sampler emits each rendered body once"
+     (define answer (gen 2))
+     (define (model _transcript prefix)
+       (cond
+         [(string=? prefix "")
+          (list (token-candidate "a" 0.0)
+                (token-candidate "ab" -0.1))]
+         [(string=? prefix "a")
+          (list (token-candidate "b" 0.0))]
+         [(string=? prefix "ab")
+          (list (token-candidate "!" 0.0))]
+         [else '()]))
+
+     (define results
+       (for/list ([result (eval model
+                               (list (assistant answer (lit "!"))))])
+         result))
+
+     (check-equal?
+      results
+      (list
+       (list
+        (message 'assistant
+                 (list (generated answer "ab")
+                       (lit "!")))))))
+
    (test-case "at-least-once can exceed the ordinary grammar budget"
      (define repeated-as
        (at-least-once (list (lit "a"))))

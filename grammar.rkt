@@ -1,6 +1,7 @@
 #lang typed/racket/base
 
-(require "common-combinators.rkt")
+(require racket/promise
+         "common-combinators.rkt")
 
 (require/typed racket/list
   [range (-> Natural Natural (Listof Natural))]
@@ -239,6 +240,12 @@
 (define (parse-at-least-once expr k source start-pos)
   (define grammar (at-least-once-grammar expr))
   (define grammar-size (length grammar))
+  ;; Different repetition splits can reach the same continuation position.
+  (define cache : (Vectorof (Promise ParseResult))
+    (build-vector
+     (add1 (parse-input-end source))
+     (lambda ([pos : Index])
+       (delay (parse-next-uncached source pos)))))
 
   (: finish Parser)
   (define (finish input end-pos)
@@ -251,16 +258,23 @@
     (result-union (finish input pos)
                   (parse-next input pos)))
 
-  (: parse-next Parser)
-  (define (parse-next input pos)
+  (: parse-next-uncached Parser)
+  (define (parse-next-uncached input pos)
     (: after-item Parser)
     (define (after-item next-input next-pos)
       (if (> next-pos pos)
           (repeat next-input next-pos)
           result-empty))
-    (drop-leading-values
-     grammar-size
-     ((parse-seq grammar after-item #t) input pos)))
+    (result-dedupe
+     (drop-leading-values
+      grammar-size
+      ((parse-seq grammar after-item #t) input pos))))
+
+  (: parse-next Parser)
+  (define (parse-next input pos)
+    (if (eq? input source)
+        (force (vector-ref cache pos))
+        (parse-next-uncached input pos)))
 
   (parse-next source start-pos))
 
