@@ -58,6 +58,8 @@
 (define (gumbel-stream expand root)
   (define debug-search? : Boolean
     (and (getenv "RACK_LLM_DEBUG_SEARCH") #t))
+  (define debug-phases? : Boolean
+    (and (getenv "RACK_LLM_DEBUG_PHASES") #t))
   (define debug-every : Positive-Integer
     (let ([value (getenv "RACK_LLM_DEBUG_EVERY")])
       (if value
@@ -69,6 +71,19 @@
   (define last-yield-popped : Natural 0)
   (define last-yield-expanded : Natural 0)
   (define started-at : Flonum (current-inexact-milliseconds))
+
+  (: log-phase (-> String Natural Flonum Flonum Natural Void))
+  (define (log-phase phase node-number start finish count)
+    (when debug-phases?
+      (eprintf
+       "sampler phase: node=~a phase=~a start=~a finish=~a duration-ms=~a count=~a\n"
+       node-number
+       phase
+       (real->decimal-string (/ (- start started-at) 1000.0) 1)
+       (real->decimal-string (/ (- finish started-at) 1000.0) 1)
+       (real->decimal-string (- finish start) 1)
+       count)
+      (flush-output (current-error-port))))
 
   (: emit-unique
      (-> (Listof EvaluatedBody)
@@ -99,6 +114,7 @@
        (define current (agenda-view-item next))
        (define rest (agenda-view-rest next))
        (when (and debug-search? (zero? (remainder popped debug-every)))
+         (define current-prefix (frontier-text current))
          (eprintf
           "sampler progress: elapsed=~a popped=~a expanded=~a queue=~a children=~a depth=~a\n"
           (real->decimal-string
@@ -109,8 +125,22 @@
           (length (agenda-items queue))
           children
           (frontier-node-depth current))
+         (when (getenv "RACK_LLM_DEBUG_PREFIX")
+           (eprintf "sampler prefix: ~s\n" current-prefix))
+         (flush-output (current-error-port)))
+       (define yield-start (current-inexact-milliseconds))
+       (when debug-phases?
+         (eprintf "sampler phase-start: node=~a phase=matcher-yields depth=~a\n"
+                  popped
+                  (frontier-node-depth current))
          (flush-output (current-error-port)))
        (define yields (frontier-yields current))
+       (define yield-finish (current-inexact-milliseconds))
+       (log-phase "matcher-yields"
+                  popped
+                  yield-start
+                  yield-finish
+                  (length yields))
        (when (and debug-search? (not (null? yields)))
          (eprintf
           "sampler yield: bodies=~a depth=~a queue=~a popped=~a (+~a) expanded=~a (+~a) children=~a\n"
@@ -130,9 +160,49 @@
         seen
         (lambda (next-seen)
           (set! expanded (add1 expanded))
-          (define successors (frontier-successors expand current))
+          (define expand-start (current-inexact-milliseconds))
+          (when debug-phases?
+            (eprintf "sampler phase-start: node=~a phase=expand queue=~a depth=~a\n"
+                     popped
+                     (length (agenda-items rest))
+                     (frontier-node-depth current))
+            (flush-output (current-error-port)))
+          (define raw-successors (expand current))
+          (define expand-finish (current-inexact-milliseconds))
+          (log-phase "expand"
+                     popped
+                     expand-start
+                     expand-finish
+                     (length raw-successors))
+          (define filter-start (current-inexact-milliseconds))
+          (when debug-phases?
+            (eprintf "sampler phase-start: node=~a phase=filter-viable children=~a\n"
+                     popped
+                     (length raw-successors))
+            (flush-output (current-error-port)))
+          (define successors (filter frontier-viable? raw-successors))
+          (define filter-finish (current-inexact-milliseconds))
+          (log-phase "filter-viable"
+                     popped
+                     filter-start
+                     filter-finish
+                     (length successors))
           (set! children (+ children (length successors)))
-          (step (agenda-push* rest successors) next-seen)))]))
+          (define insert-start (current-inexact-milliseconds))
+          (when debug-phases?
+            (eprintf "sampler phase-start: node=~a phase=agenda-push queue=~a children=~a\n"
+                     popped
+                     (length (agenda-items rest))
+                     (length successors))
+            (flush-output (current-error-port)))
+          (define next-queue (agenda-push* rest successors))
+          (define insert-finish (current-inexact-milliseconds))
+          (log-phase "agenda-push"
+                     popped
+                     insert-start
+                     insert-finish
+                     (length (agenda-items next-queue)))
+          (step next-queue next-seen)))]))
   (step (agenda-singleton frontier-better? root)
         (ann (hash) SeenTexts)))
 
@@ -141,11 +211,56 @@
   (lambda ([parent : FrontierNode])
     (if (>= (frontier-node-depth parent) max-depth)
         '()
-        (condition-subtrees
-         parent
-         (filter-map (lambda ([c : token-candidate])
-                       (frontier-child parent c))
-                     (oracle transcript (frontier-text parent)))))))
+        (let ()
+          (define debug-phases? : Boolean
+            (and (getenv "RACK_LLM_DEBUG_PHASES") #t))
+          (define oracle-start (current-inexact-milliseconds))
+          (when debug-phases?
+            (eprintf "sampler phase-start: depth=~a phase=oracle prefix-length=~a\n"
+                     (frontier-node-depth parent)
+                     (string-length (frontier-text parent)))
+            (flush-output (current-error-port)))
+          (define candidates (oracle transcript (frontier-text parent)))
+          (define oracle-finish (current-inexact-milliseconds))
+          (when debug-phases?
+            (eprintf "sampler phase: depth=~a phase=oracle duration-ms=~a count=~a\n"
+                     (frontier-node-depth parent)
+                     (real->decimal-string (- oracle-finish oracle-start) 1)
+                     (length candidates))
+            (flush-output (current-error-port)))
+          (define build-start (current-inexact-milliseconds))
+          (when debug-phases?
+            (eprintf "sampler phase-start: depth=~a phase=build-children candidates=~a\n"
+                     (frontier-node-depth parent)
+                     (length candidates))
+            (flush-output (current-error-port)))
+          (define result
+            (condition-subtrees
+             parent
+             (filter-map (lambda ([c : token-candidate])
+                           (define child (frontier-child parent c))
+                           (when (and child
+                                      (getenv "RACK_LLM_DEBUG_CLOSERS")
+                                      (regexp-match?
+                                       #rx"\\]"
+                                       (token-candidate-text c)))
+                             (eprintf
+                              "sampler closer-child: token=~s viable=~a yields=~a depth=~a\n"
+                              (token-candidate-text c)
+                              (frontier-viable? child)
+                              (length (frontier-yields child))
+                              (frontier-node-depth child))
+                             (flush-output (current-error-port)))
+                           child)
+                         candidates)))
+          (define build-finish (current-inexact-milliseconds))
+          (when debug-phases?
+            (eprintf "sampler phase: depth=~a phase=build-children duration-ms=~a count=~a\n"
+                     (frontier-node-depth parent)
+                     (real->decimal-string (- build-finish build-start) 1)
+                     (length result))
+            (flush-output (current-error-port)))
+          result))))
 
 ;; Frontier algebra
 
